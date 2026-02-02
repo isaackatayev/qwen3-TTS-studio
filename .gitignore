@@ -68,6 +68,7 @@ Thumbs.db
 test_*.py
 run_all_tests.sh
 validate_*.py
+generate_*_podcast.py
 
 # Test artifacts
 test_screenshots/
