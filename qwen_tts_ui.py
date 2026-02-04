@@ -1396,6 +1396,9 @@ def clone_voice_multi(
     if not audio_files:
         raise gr.Error("Please upload at least one reference audio sample")
 
+    if len(audio_files) > 3:
+        raise gr.Error("Maximum 3 audio samples allowed")
+
     try:
         transcripts = json.loads(transcripts_json) if transcripts_json else {}
     except json.JSONDecodeError:
@@ -1403,20 +1406,20 @@ def clone_voice_multi(
 
     audio_paths = []
     audio_transcripts = []
-    for af in audio_files:
+    for af in audio_files[:3]:
         if af is None:
             continue
-        path = af if isinstance(af, str) else af.name
+        path = extract_file_path(af)
+        if not path:
+            continue
         audio_paths.append(path)
-        fname = Path(path).name
-        audio_transcripts.append(transcripts.get(fname, ""))
+        audio_transcripts.append(transcripts.get(path, ""))
 
     if not audio_paths:
         raise gr.Error("No valid audio files provided")
 
     has_transcripts = any(t.strip() for t in audio_transcripts)
-    if not has_transcripts:
-        raise gr.Error("Please provide transcript for at least the primary sample")
+    x_vector_only_mode = not has_transcripts
 
     save_settings(
         {
@@ -1452,7 +1455,7 @@ def clone_voice_multi(
             voice_clone_prompt = create_combined_voice_clone_prompt(
                 model=model,
                 sample_infos=sample_infos,
-                x_vector_only_mode=False,
+                x_vector_only_mode=x_vector_only_mode,
             )
             primary_info = next(
                 (s for s in sample_infos if s.is_primary), sample_infos[0]
@@ -1462,7 +1465,7 @@ def clone_voice_multi(
             voice_clone_prompt = model.create_voice_clone_prompt(
                 ref_audio=primary_info.path,
                 ref_text=primary_info.transcript,
-                x_vector_only_mode=False,
+                x_vector_only_mode=x_vector_only_mode,
             )
 
         output_audio = None
@@ -1561,7 +1564,7 @@ def analyze_uploaded_samples(audio_files: list) -> tuple[str, str]:
         return "", ""
 
     audio_paths = []
-    for af in audio_files:
+    for af in audio_files[:3]:
         if af is None:
             continue
         path = af if isinstance(af, str) else af.name
@@ -1573,9 +1576,109 @@ def analyze_uploaded_samples(audio_files: list) -> tuple[str, str]:
     sample_infos = analyze_audio_samples(audio_paths)
     summary = format_samples_summary(sample_infos)
     warnings = get_sample_warnings(sample_infos)
+
+    if len(audio_files) > 3:
+        warnings.insert(0, "Only the first 3 samples will be used.")
+
     warnings_html = "<br>".join(warnings) if warnings else ""
 
     return summary, warnings_html
+
+
+def extract_file_path(file_obj) -> str | None:
+    if file_obj is None:
+        return None
+    if isinstance(file_obj, str):
+        return file_obj
+    if isinstance(file_obj, dict):
+        return file_obj.get("path") or file_obj.get("name")
+    return getattr(file_obj, "path", None) or getattr(file_obj, "name", None)
+
+
+def flush_transcripts_to_state(
+    transcript_state: dict,
+    current_paths: list,
+    t1: str,
+    t2: str,
+    t3: str,
+) -> dict:
+    if not current_paths:
+        return transcript_state if isinstance(transcript_state, dict) else {}
+
+    new_state = dict(transcript_state) if isinstance(transcript_state, dict) else {}
+    transcripts = [t1, t2, t3]
+
+    for i, path in enumerate(current_paths[:3]):
+        if path and i < len(transcripts):
+            new_state[path] = transcripts[i] or ""
+
+    return new_state
+
+
+def update_transcript_fields(audio_files: list, transcript_state: dict):
+    empty_result = (
+        gr.update(value="*Upload audio samples to enter transcripts.*"),
+        gr.update(visible=False, label="Sample 1 (Primary)", value=""),
+        gr.update(visible=False, label="Sample 2", value=""),
+        gr.update(visible=False, label="Sample 3", value=""),
+        gr.update(visible=False),
+        transcript_state if isinstance(transcript_state, dict) else {},
+        [],
+    )
+
+    if not audio_files:
+        return empty_result
+
+    file_paths = []
+    file_names = []
+    for af in audio_files[:3]:
+        path = extract_file_path(af)
+        if path:
+            file_paths.append(path)
+            file_names.append(Path(path).name)
+
+    num_files = len(file_paths)
+    if num_files == 0:
+        return empty_result
+
+    prev_state = transcript_state if isinstance(transcript_state, dict) else {}
+
+    transcript_values = []
+    for path in file_paths:
+        transcript_values.append(prev_state.get(path, ""))
+
+    new_state = dict(prev_state)
+    for i, path in enumerate(file_paths):
+        if path not in new_state:
+            new_state[path] = transcript_values[i]
+
+    max_state_entries = 20
+    if len(new_state) > max_state_entries:
+        current_set = set(file_paths)
+        keys_to_remove = [k for k in new_state if k not in current_set]
+        for k in keys_to_remove[: len(new_state) - max_state_entries]:
+            del new_state[k]
+
+    info_text = f"*Enter transcript for each sample. {num_files} file(s) uploaded.*"
+
+    t1_update = gr.update(
+        visible=True,
+        label=f"Sample 1 (Primary): {file_names[0]}",
+        value=transcript_values[0] if num_files >= 1 else "",
+    )
+    t2_update = gr.update(
+        visible=num_files >= 2,
+        label=f"Sample 2: {file_names[1]}" if num_files >= 2 else "Sample 2",
+        value=transcript_values[1] if num_files >= 2 else "",
+    )
+    t3_update = gr.update(
+        visible=num_files >= 3,
+        label=f"Sample 3: {file_names[2]}" if num_files >= 3 else "Sample 3",
+        value=transcript_values[2] if num_files >= 3 else "",
+    )
+    btn_update = gr.update(visible=num_files >= 1)
+
+    return info_text, t1_update, t2_update, t3_update, btn_update, new_state, file_paths
 
 
 def save_cloned_voice_multi(
@@ -1643,8 +1746,10 @@ def save_cloned_voice_multi(
                 (s for s in samples_meta if s.get("is_primary")),
                 samples_meta[0] if samples_meta else None,
             )
-            if primary_sample:
+            if primary_sample and primary_sample.get("transcript"):
                 primary_transcript = primary_sample.get("transcript", "")
+        if transcripts:
+            primary_transcript = next(iter(transcripts.values()), "")
 
         metadata = {
             "name": voice_name,
@@ -3205,7 +3310,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             )
 
                             vc_ref_audio = gr.File(
-                                label="Upload Audio Samples",
+                                label="Upload Audio Samples (max 3)",
                                 file_count="multiple",
                                 file_types=["audio"],
                                 type="filepath",
@@ -3230,30 +3335,37 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             )
 
                             with gr.Accordion("Sample Transcripts", open=True):
-                                gr.Markdown(
-                                    "*Enter transcript for each sample. Primary sample's transcript is required.*"
+                                vc_transcripts_info = gr.Markdown(
+                                    "*Upload audio samples to enter transcripts.*"
                                 )
                                 vc_transcript_1 = gr.Textbox(
                                     label="Sample 1 (Primary)",
                                     placeholder="Enter the exact words spoken...",
                                     lines=2,
+                                    visible=False,
                                 )
                                 vc_transcript_2 = gr.Textbox(
                                     label="Sample 2",
                                     placeholder="Optional: transcript for sample 2...",
                                     lines=2,
+                                    visible=False,
                                 )
                                 vc_transcript_3 = gr.Textbox(
                                     label="Sample 3",
                                     placeholder="Optional: transcript for sample 3...",
                                     lines=2,
+                                    visible=False,
                                 )
                                 with gr.Row():
                                     vc_auto_transcribe_btn = gr.Button(
-                                        "Auto-transcribe Primary", size="sm"
+                                        "Auto-transcribe Primary",
+                                        size="sm",
+                                        visible=False,
                                     )
 
                             vc_transcripts_json = gr.State(value="{}")
+                            vc_transcript_state = gr.State(value={})
+                            vc_current_file_paths = gr.State(value=[])
 
                             vc_model = gr.Radio(
                                 ["1.7B-Base", "0.6B-Base"],
@@ -5392,28 +5504,74 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
             for i, f in enumerate(files[:3]):
                 if f is None:
                     continue
-                fname = Path(f).name if isinstance(f, str) else Path(f.name).name
+                path = extract_file_path(f)
+                if not path:
+                    continue
                 transcript = [t1, t2, t3][i] if i < 3 else ""
-                if transcript and transcript.strip():
-                    transcripts[fname] = transcript.strip()
+                transcripts[path] = transcript.strip() if transcript else ""
         return json.dumps(transcripts)
 
     def auto_transcribe_first_sample(files):
         if not files:
             return ""
         first_file = files[0] if isinstance(files, list) else files
-        if first_file is None:
+        path = extract_file_path(first_file)
+        if not path:
             return ""
-        path = first_file if isinstance(first_file, str) else first_file.name
         return auto_transcribe_audio(path)
 
     vc_ref_audio.change(
+        fn=flush_transcripts_to_state,
+        inputs=[
+            vc_transcript_state,
+            vc_current_file_paths,
+            vc_transcript_1,
+            vc_transcript_2,
+            vc_transcript_3,
+        ],
+        outputs=[vc_transcript_state],
+    ).then(
+        fn=update_transcript_fields,
+        inputs=[vc_ref_audio, vc_transcript_state],
+        outputs=[
+            vc_transcripts_info,
+            vc_transcript_1,
+            vc_transcript_2,
+            vc_transcript_3,
+            vc_auto_transcribe_btn,
+            vc_transcript_state,
+            vc_current_file_paths,
+        ],
+    ).then(
         fn=analyze_uploaded_samples,
         inputs=[vc_ref_audio],
         outputs=[vc_samples_summary, vc_samples_warnings],
     )
 
+    for transcript_box in [vc_transcript_1, vc_transcript_2, vc_transcript_3]:
+        transcript_box.change(
+            fn=flush_transcripts_to_state,
+            inputs=[
+                vc_transcript_state,
+                vc_current_file_paths,
+                vc_transcript_1,
+                vc_transcript_2,
+                vc_transcript_3,
+            ],
+            outputs=[vc_transcript_state],
+        )
+
     vc_clone_btn.click(
+        fn=flush_transcripts_to_state,
+        inputs=[
+            vc_transcript_state,
+            vc_current_file_paths,
+            vc_transcript_1,
+            vc_transcript_2,
+            vc_transcript_3,
+        ],
+        outputs=[vc_transcript_state],
+    ).then(
         fn=lambda files, t1, t2, t3: build_transcripts_json(files, t1, t2, t3),
         inputs=[vc_ref_audio, vc_transcript_1, vc_transcript_2, vc_transcript_3],
         outputs=[vc_transcripts_json],
@@ -5443,9 +5601,29 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
         fn=auto_transcribe_first_sample,
         inputs=[vc_ref_audio],
         outputs=[vc_transcript_1],
+    ).then(
+        fn=flush_transcripts_to_state,
+        inputs=[
+            vc_transcript_state,
+            vc_current_file_paths,
+            vc_transcript_1,
+            vc_transcript_2,
+            vc_transcript_3,
+        ],
+        outputs=[vc_transcript_state],
     )
 
     vc_save_btn.click(
+        fn=flush_transcripts_to_state,
+        inputs=[
+            vc_transcript_state,
+            vc_current_file_paths,
+            vc_transcript_1,
+            vc_transcript_2,
+            vc_transcript_3,
+        ],
+        outputs=[vc_transcript_state],
+    ).then(
         fn=lambda files, t1, t2, t3: build_transcripts_json(files, t1, t2, t3),
         inputs=[vc_ref_audio, vc_transcript_1, vc_transcript_2, vc_transcript_3],
         outputs=[vc_transcripts_json],
