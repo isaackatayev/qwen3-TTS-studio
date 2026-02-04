@@ -3593,14 +3593,10 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             )
                             gr.Markdown(
                                 """
-**English Examples:**
+**Examples:**
 - "A cheerful young female voice with high pitch and energetic tone"
 - "Deep male voice, mature, authoritative, speaking slowly and clearly"
 - "Elderly woman, warm and gentle, with a slight tremor in voice"
-
-**한국어 예시:**
-- "밝고 활기찬 20대 여성 목소리, 높은 톤"
-- "차분하고 신뢰감 있는 중년 남성 목소리"
                                 """,
                                 elem_classes=["info-text"],
                             )
