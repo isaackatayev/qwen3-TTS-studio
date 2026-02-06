@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, cast
 
-import config
 from podcast import outline as outline_generator
 from podcast import transcript as transcript_generator
+from podcast.llm_client import LLMConfig
 from audio import batch as batch_processor
 from audio import combiner as audio_combiner
 from storage import history as storage
@@ -119,6 +119,7 @@ def generate_podcast(
     voice_selections: list[dict[str, str]],
     quality_preset: str | dict[str, object] | None,
     progress_callback: ProgressCallback | None = None,
+    llm_config: LLMConfig | None = None,
 ) -> dict[str, str]:
     """
     Orchestrate full podcast generation workflow.
@@ -140,9 +141,11 @@ def generate_podcast(
     briefing = str(content_input.get("briefing", "")).strip()
     language = str(content_input.get("language", "English")).strip()
     num_segments_raw = content_input.get("num_segments", 5)
+    if isinstance(num_segments_raw, bool) or not isinstance(num_segments_raw, (int, str)):
+        raise ValueError("num_segments must be an integer.")
     try:
         num_segments = int(num_segments_raw)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise ValueError("num_segments must be an integer.") from exc
 
     tts_params = _resolve_tts_params(quality_preset, language)
@@ -150,8 +153,6 @@ def generate_podcast(
 
     podcast_dir: Path | None = None
     try:
-        _ = config.get_openai_api_key()
-
         _notify(progress_callback, "create_directory", {"status": "started"})
         podcast_name = _timestamped_podcast_name()
         podcast_dir = storage.create_podcast_directory(podcast_name)
@@ -174,6 +175,7 @@ def generate_podcast(
                 num_segments=num_segments,
                 speakers=speaker_profile.speakers,
                 personas=personas,
+                llm_config=llm_config,
             ),
         )
         _notify(progress_callback, "generate_outline", {"status": "completed", "outline": outline.model_dump()})
@@ -188,6 +190,7 @@ def generate_podcast(
                 speakers=speaker_profile.speakers,
                 personas=personas,
                 language=language,
+                llm_config=llm_config,
             ),
         )
         _notify(progress_callback, "generate_transcript", {"status": "completed", "transcript": transcript.model_dump()})
@@ -259,6 +262,8 @@ def generate_podcast(
              "speakers": [speaker.model_dump() for speaker in speaker_profile.speakers],
              "tts_params": tts_params,
              "quality_preset": quality_preset,
+             "llm_provider": llm_config.provider.value if llm_config else "openai",
+             "llm_model": llm_config.model if llm_config else "default",
              "created_at": started_at.isoformat(),
              "completed_at": finished_at.isoformat(),
          }
@@ -296,6 +301,7 @@ def generate_outline_only(
     num_segments: int,
     voice_selections: list[dict[str, str]],
     progress_callback: ProgressCallback | None = None,
+    llm_config: LLMConfig | None = None,
 ) -> tuple[Outline, SpeakerProfile]:
     if not topic.strip():
         raise ValueError("Topic cannot be empty.")
@@ -317,11 +323,12 @@ def generate_outline_only(
             num_segments=num_segments,
             speakers=speaker_profile.speakers,
             personas=personas,
+            llm_config=llm_config,
         ),
     )
-    
+
     _notify(progress_callback, "generate_outline", {"status": "completed", "outline": outline.model_dump()})
-    
+
     return outline, speaker_profile
 
 
@@ -332,6 +339,7 @@ def generate_transcript_only(
     speaker_profile: SpeakerProfile,
     language: str = "English",
     progress_callback: ProgressCallback | None = None,
+    llm_config: LLMConfig | None = None,
 ) -> Transcript:
     _notify(progress_callback, "generate_transcript", {"status": "started"})
     
@@ -346,11 +354,12 @@ def generate_transcript_only(
             speakers=speaker_profile.speakers,
             personas=personas,
             language=language,
+            llm_config=llm_config,
         ),
     )
-    
+
     _notify(progress_callback, "generate_transcript", {"status": "completed", "transcript": transcript.model_dump()})
-    
+
     return transcript
 
 
@@ -531,6 +540,7 @@ if __name__ == "__main__":
         _ = output_path.write_bytes(b"ID3")
         return output_path
 
+    import config
     config.get_openai_api_key = lambda: "test"
     voice_selection.create_speaker_profile = mock_create_profile
     outline_generator.generate_outline = mock_generate_outline

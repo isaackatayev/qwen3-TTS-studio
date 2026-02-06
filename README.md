@@ -26,7 +26,8 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 
 ### Podcast Generation
 - **One-Click Podcasts**: Enter a topic, get a complete podcast
-- **AI Script Writing**: GPT-powered outline and transcript generation
+- **AI Script Writing**: LLM-powered outline and transcript generation
+- **Multi-Provider LLM Support**: OpenAI, Ollama, and OpenRouter
 - **Multi-Speaker Support**: Assign different voices to each speaker
 - **Custom Personas**: Create and save speaker personalities
 
@@ -41,7 +42,11 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 - Python 3.12+
 - macOS (MPS) / Linux (CUDA)
 - 16GB+ RAM
-- OpenAI API Key (for Podcast feature)
+- `openai` Python package (for podcast LLM client)
+- For podcast script generation, configure one provider:
+  - Ollama (local): no external API key required
+  - OpenAI: `OPENAI_API_KEY`
+  - OpenRouter: `OPENROUTER_API_KEY`
 
 ## Installation
 
@@ -103,11 +108,16 @@ modelscope download --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --local_dir ./Q
 
 ### 5. Environment Variables
 
-Create a `.env` file:
+Create a `.env` file (choose based on provider):
 
 ```bash
 OPENAI_API_KEY=your_openai_api_key_here
+OPENROUTER_API_KEY=your_openrouter_api_key_here
 ```
+
+Notes:
+- If you use Ollama, API key is not required (default local endpoint: `http://localhost:11434/v1`).
+- You can also enter provider/model/base URL/API key directly in the Podcast tab under **LLM Provider**.
 
 ## Usage
 

@@ -1,172 +1,28 @@
 """Prompt templates for podcast outline and transcript generation."""
 
+from __future__ import annotations
+
 import json
-from typing import Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from storage.persona_models import Persona
 
 
-def get_outline_prompt(
-    topic: str,
-    key_points: list[str],
-    briefing: str,
-    num_segments: int = 5,
-    speakers: Optional[list[str]] = None,
-) -> str:
-    """
-    Generate a prompt for creating a podcast outline.
-
-    Args:
-        topic: Main topic of the podcast episode.
-        key_points: List of key points to cover.
-        briefing: Background information or context.
-        num_segments: Number of segments to create (default: 5).
-        speakers: List of speaker names participating (optional).
-
-    Returns:
-        A formatted prompt string for the LLM.
-    """
-    speakers_list = speakers or ["Host", "Expert"]
-    speakers_str = ", ".join(speakers_list)
-
-    outline_schema = {
-        "type": "object",
-        "properties": {
-            "segments": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string", "description": "Segment title"},
-                        "description": {
-                            "type": "string",
-                            "description": "Segment summary or notes",
-                        },
-                        "size": {
-                            "type": "string",
-                            "enum": ["short", "medium", "long"],
-                            "description": "Segment length",
-                        },
-                    },
-                    "required": ["title", "description", "size"],
-                },
-                "minItems": 1,
-                "maxItems": 10,
-            }
-        },
-        "required": ["segments"],
-    }
-
-    examples = """
-EXAMPLE 1: Tech Interview Outline
-Topic: "AI in Healthcare"
-Key Points: ["Diagnosis accuracy", "Patient privacy", "Cost reduction"]
-Speakers: ["Host", "Dr. Smith (Expert)"]
-
-Output:
-{
-  "segments": [
-    {
-      "title": "Introduction & Guest Welcome",
-      "description": "Host introduces Dr. Smith and the topic of AI in healthcare. Brief overview of what listeners will learn.",
-      "size": "short"
-    },
-    {
-      "title": "Current State of AI in Diagnosis",
-      "description": "Dr. Smith explains how AI is currently being used for medical diagnosis, with real-world examples.",
-      "size": "medium"
-    },
-    {
-      "title": "Privacy & Ethical Concerns",
-      "description": "Discussion of patient data privacy, regulatory compliance, and ethical considerations.",
-      "size": "medium"
-    },
-    {
-      "title": "Cost Impact & Accessibility",
-      "description": "How AI can reduce healthcare costs and improve accessibility in underserved areas.",
-      "size": "medium"
-    },
-    {
-      "title": "Future Outlook & Q&A",
-      "description": "Dr. Smith shares predictions for the next 5 years. Host asks audience questions.",
-      "size": "short"
-    }
-  ]
-}
-
-EXAMPLE 2: Panel Discussion Outline
-Topic: "Remote Work Trends"
-Key Points: ["Productivity", "Work-life balance", "Team collaboration"]
-Speakers: ["Host", "Manager", "Employee", "HR Lead"]
-
-Output:
-{
-  "segments": [
-    {
-      "title": "Opening & Panel Introduction",
-      "description": "Host welcomes panelists and sets context for remote work discussion.",
-      "size": "short"
-    },
-    {
-      "title": "Productivity Metrics & Results",
-      "description": "Manager shares data on productivity changes. Employee perspective on focus and distractions.",
-      "size": "medium"
-    },
-    {
-      "title": "Work-Life Balance Challenges",
-      "description": "Panelists discuss boundary-setting, burnout prevention, and mental health.",
-      "size": "medium"
-    },
-    {
-      "title": "Team Collaboration & Culture",
-      "description": "HR Lead discusses maintaining company culture. Panelists share collaboration tools and practices.",
-      "size": "medium"
-    },
-    {
-      "title": "Closing Remarks & Takeaways",
-      "description": "Each panelist shares one key takeaway. Host summarizes main points.",
-      "size": "short"
-    }
-  ]
-}
-"""
-
-    prompt = f"""You are an expert podcast producer creating a structured outline for an engaging podcast episode.
-
-TOPIC: {topic}
-
-KEY POINTS TO COVER:
-{chr(10).join(f"- {point}" for point in key_points)}
-
-BACKGROUND & BRIEFING:
-{briefing}
-
-SPEAKERS PARTICIPATING:
-{speakers_str}
-
-REQUIREMENTS:
-1. Create exactly {num_segments} segments for this podcast episode.
-2. Each segment should have a clear title, description, and size (short/medium/long).
-3. Segments should flow logically and build on each other.
-4. Include all key points across the segments.
-5. Vary segment sizes for pacing (don't make all segments the same length).
-6. Ensure the outline is engaging and maintains listener interest.
-7. Consider the speaker roles when planning dialogue flow.
-
-SPEAKER ROLE GUIDELINES:
-- Host: Asks questions, guides conversation, keeps time, welcomes guests
-- Expert: Provides deep knowledge, explains concepts, answers questions
-- Guest: Shares personal experience, offers perspective, responds to host
-- Narrator: Provides context, transitions, background information
-
-OUTPUT FORMAT:
-Return ONLY valid JSON matching this schema:
-{json.dumps(outline_schema, indent=2)}
-
-EXAMPLES OF GOOD OUTLINES:
-{examples}
-
-Now create the outline for this episode:"""
-
-    return prompt
+def format_persona_context(personas: dict[str, Persona] | None) -> str:
+    if not personas:
+        return ""
+    lines = []
+    for _, persona in personas.items():
+        full_context = f"{persona.background} {persona.bio}".strip()
+        context_truncated = full_context[:200] + "..." if len(full_context) > 200 else full_context
+        expertise_str = ", ".join(persona.expertise[:3]) if persona.expertise else "General"
+        line = (
+            f"- {persona.character_name}: {persona.personality}, {persona.speaking_style} speaker. "
+            f"Expertise: {expertise_str}. {context_truncated}"
+        )
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def get_transcript_prompt(
@@ -281,8 +137,6 @@ Output:
 }
 """
 
-    segment_tone = "concluding remarks and key takeaways" if is_final else "engaging discussion"
-
     prompt = f"""You are an expert podcast scriptwriter creating natural, engaging dialogue for a podcast segment.
 
 IMPORTANT: Generate all dialogue in {language}. The entire transcript must be written in {language}.
@@ -300,7 +154,7 @@ SPEAKERS:
 {", ".join(speakers)}
 
 SPEAKER ROLE GUIDELINES:
-{chr(10).join(f"- {name}: {role}" for name, role in speaker_roles.items() if name in speakers)}
+{chr(10).join(f"- {name}: {role}" for name, role in speaker_roles.items())}
 
 REQUIREMENTS:
 1. Generate approximately {turns} dialogue turns (back-and-forth exchanges).
@@ -314,6 +168,7 @@ REQUIREMENTS:
 9. {"Focus on concluding remarks, key takeaways, and wrapping up the discussion." if is_final else "Keep the discussion engaging and exploratory."}
 10. Ensure all speakers get roughly equal speaking time.
 11. Make the dialogue sound like a real conversation, not a Q&A interview.
+12. Use speaker names exactly as listed in SPEAKERS; do not output role labels unless the role text is an exact speaker name.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON matching this schema:
@@ -328,31 +183,6 @@ Now create the transcript for this segment:"""
 
 
 if __name__ == "__main__":
-    # Test outline prompt rendering
-    outline_prompt = get_outline_prompt(
-        topic="The Future of Remote Work",
-        key_points=[
-            "Productivity trends",
-            "Employee satisfaction",
-            "Company culture challenges",
-            "Technology infrastructure",
-        ],
-        briefing="Post-pandemic analysis of remote work adoption and its long-term impact on businesses.",
-        num_segments=5,
-        speakers=["Host", "HR Manager", "Tech Lead", "Remote Employee"],
-    )
-
-    print("=" * 80)
-    print("OUTLINE PROMPT TEST")
-    print("=" * 80)
-    print(outline_prompt[:500] + "...\n")
-    assert "The Future of Remote Work" in outline_prompt
-    assert "5" in outline_prompt
-    assert "segments" in outline_prompt
-    assert "short" in outline_prompt
-    print("✓ Outline prompt renders correctly\n")
-
-    # Test transcript prompt rendering
     transcript_prompt = get_transcript_prompt(
         outline="1. Introduction\n2. Main Discussion\n3. Closing",
         segment="Main Discussion: Productivity Trends",

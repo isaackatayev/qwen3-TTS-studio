@@ -1,4 +1,4 @@
-"""OpenAI-powered outline generator for podcast episodes."""
+"""LLM-powered outline generator for podcast episodes."""
 
 # pyright: reportImplicitRelativeImport=false, reportMissingImports=false, reportDeprecated=false
 # pyright: reportExplicitAny=false, reportUnknownVariableType=false, reportUnknownMemberType=false
@@ -10,23 +10,16 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 from importlib import import_module
-from typing import Callable, Mapping, Protocol, cast
+from typing import Protocol, cast
 
 from pydantic import ValidationError
 
+from podcast.llm_client import LLMConfig, LLMProvider, chat_completion, create_llm_client, get_default_config
+from podcast.prompts import format_persona_context
 from storage.persona_models import Persona
 
-_config_module = import_module("config")
-get_openai_api_key = cast(
-    Callable[[], str], getattr(_config_module, "get_openai_api_key")
-)
 _models_module = import_module("podcast.models")
-
-MODEL_NAME = "gpt-5.2"
-MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = (1, 2, 4)
 
 
 class _Speaker(Protocol):
@@ -56,64 +49,6 @@ OutlineClass = cast(type[_Outline], getattr(_models_module, "Outline"))
 SpeakerProfileClass = cast(
     type[_SpeakerProfile], getattr(_models_module, "SpeakerProfile")
 )
-
-
-class _OpenAIMessage(Protocol):
-    content: str
-
-
-class _OpenAIChoice(Protocol):
-    message: _OpenAIMessage
-
-
-class _OpenAIResponse(Protocol):
-    choices: Sequence[_OpenAIChoice]
-
-
-class _OpenAIChatCompletions(Protocol):
-    def create(
-        self,
-        *,
-        model: str,
-        messages: Sequence[dict[str, str]],
-        response_format: dict[str, str],
-        temperature: float,
-    ) -> _OpenAIResponse:
-        ...
-
-
-class _OpenAIChat(Protocol):
-    completions: _OpenAIChatCompletions
-
-
-class _OpenAIClient(Protocol):
-    chat: _OpenAIChat
-
-
-class _OpenAIConstructor(Protocol):
-    def __call__(self, *, api_key: str) -> _OpenAIClient:
-        ...
-
-
-def _load_openai() -> tuple[
-    _OpenAIConstructor, type[Exception], type[Exception], type[Exception]
-]:
-    try:
-        module = import_module("openai")
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "openai package is required. Install it in a virtual environment."
-        ) from exc
-
-    try:
-        openai_client = cast(_OpenAIConstructor, getattr(module, "OpenAI"))
-        rate_limit_error = cast(type[Exception], getattr(module, "RateLimitError"))
-        api_timeout_error = cast(type[Exception], getattr(module, "APITimeoutError"))
-        api_error = cast(type[Exception], getattr(module, "APIError"))
-    except AttributeError as exc:
-        raise RuntimeError("openai package missing expected symbols.") from exc
-
-    return openai_client, rate_limit_error, api_timeout_error, api_error
 
 
 def _coerce_speakers(
@@ -147,21 +82,7 @@ def _format_speakers(speakers: Sequence[_Speaker]) -> str:
     return "\n".join(lines)
 
 
-def _format_persona_context(personas: dict[str, Persona] | None) -> str:
-    if not personas:
-        return ""
-    lines = []
-    for _, persona in personas.items():
-        # Combine background and bio for full character context
-        full_context = f"{persona.background} {persona.bio}".strip()
-        context_truncated = full_context[:200] + "..." if len(full_context) > 200 else full_context
-        expertise_str = ", ".join(persona.expertise[:3]) if persona.expertise else "General"
-        line = (
-            f"- {persona.character_name}: {persona.personality}, {persona.speaking_style} speaker. "
-            f"Expertise: {expertise_str}. {context_truncated}"
-        )
-        lines.append(line)
-    return "\n".join(lines)
+_format_persona_context = format_persona_context
 
 
 def _segment_size_targets(num_segments: int) -> dict[str, int]:
@@ -257,16 +178,6 @@ Return ONLY valid JSON matching this schema:
 """
 
 
-def _extract_response_content(response: _OpenAIResponse) -> str:
-    try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError) as exc:
-        raise ValueError("OpenAI response missing message content.") from exc
-    if not content:
-        raise ValueError("OpenAI response returned empty content.")
-    return content
-
-
 def _validate_distribution(outline: _Outline, size_targets: dict[str, int]) -> None:
     counts = {"short": 0, "medium": 0, "long": 0}
     for segment in outline.segments:
@@ -286,17 +197,17 @@ def _parse_outline_response(
 ) -> _Outline:
     try:
         payload = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Invalid JSON response from OpenAI.") from exc
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("Invalid JSON response from LLM.") from exc
 
     if not isinstance(payload, dict):
-        raise ValueError("OpenAI response must be a JSON object.")
+        raise ValueError("LLM response must be a JSON object.")
     payload = cast(dict[str, object], payload)
 
     try:
         outline = OutlineClass.model_validate(payload)
     except ValidationError as exc:
-        raise ValueError("OpenAI response does not match Outline schema.") from exc
+        raise ValueError("LLM response does not match Outline schema.") from exc
 
     if len(outline.segments) != num_segments:
         raise ValueError(
@@ -314,21 +225,9 @@ def generate_outline(
     num_segments: int,
     speakers: Sequence[_Speaker] | _SpeakerProfile,
     personas: dict[str, Persona] | None = None,
+    llm_config: LLMConfig | None = None,
 ) -> _Outline:
-    """
-    Generate a podcast outline using OpenAI.
-
-    Args:
-        topic: Main topic for the episode.
-        key_points: Key points that must be covered.
-        briefing: Style or background briefing.
-        num_segments: Exact number of segments.
-        speakers: List of Speaker instances or a SpeakerProfile.
-        personas: Optional dict mapping voice_id to Persona for enhanced context.
-
-    Returns:
-        Outline Pydantic model.
-    """
+    """Generate a podcast outline using the configured LLM provider."""
     if num_segments < 1:
         raise ValueError("num_segments must be at least 1.")
 
@@ -344,15 +243,22 @@ def generate_outline(
         personas=personas,
     )
 
-    OpenAI, RateLimitError, APITimeoutError, APIError = _load_openai()
-    client = OpenAI(api_key=get_openai_api_key())
-    last_error: Exception | None = None
-    total_attempts = MAX_RETRIES + 1
+    if llm_config is None:
+        # Fallback to OpenAI for backward compatibility
+        from config import get_openai_api_key
+        llm_config = get_default_config(
+            LLMProvider.OPENAI,
+            api_key=get_openai_api_key(),
+        )
 
-    for attempt in range(total_attempts):
+    client = create_llm_client(llm_config)
+
+    last_error: Exception | None = None
+    for attempt in range(3):
         try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
+            content = chat_completion(
+                client=client,
+                model=llm_config.model,
                 messages=[
                     {
                         "role": "system",
@@ -363,66 +269,16 @@ def generate_outline(
                     },
                     {"role": "user", "content": prompt},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0.4,
+                temperature=llm_config.temperature,
+                json_mode=True,
+                provider=llm_config.provider,
             )
-            content = _extract_response_content(response)
             return _parse_outline_response(content, num_segments, size_targets)
-        except (RateLimitError, APITimeoutError, APIError) as exc:
-            last_error = exc
         except ValueError as exc:
             last_error = exc
-
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_BACKOFF_SECONDS[attempt])
+            if attempt < 2:
+                time.sleep((1, 2, 4)[attempt])
 
     raise RuntimeError(
-        f"Failed to generate outline after {total_attempts} attempts."
+        "Failed to generate outline after 3 attempts."
     ) from last_error
-
-
-@dataclass
-class _MockMessage:
-    content: str
-
-
-@dataclass
-class _MockChoice:
-    message: _OpenAIMessage
-
-
-@dataclass
-class _MockResponse:
-    choices: Sequence[_OpenAIChoice]
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "_MockResponse":
-        content = json.dumps(payload)
-        return cls(choices=(_MockChoice(message=_MockMessage(content=content)),))
-
-
-def _build_mock_segments(size_targets: dict[str, int]) -> list[dict[str, str]]:
-    segments: list[dict[str, str]] = []
-    index = 1
-    for size in ("short", "medium", "long"):
-        for _ in range(size_targets.get(size, 0)):
-            segments.append(
-                {
-                    "title": f"{size.title()} Segment {index}",
-                    "description": f"Description for {size} segment {index}.",
-                    "size": size,
-                }
-            )
-            index += 1
-    return segments
-
-
-if __name__ == "__main__":
-    test_segments = 5
-    targets = _segment_size_targets(test_segments)
-    mock_payload = {"segments": _build_mock_segments(targets)}
-    mock_response = _MockResponse.from_payload(mock_payload)
-    mock_content = _extract_response_content(mock_response)
-    outline = _parse_outline_response(mock_content, test_segments, targets)
-    assert len(outline.segments) == test_segments
-    print("Mock OpenAI response parsed successfully.")

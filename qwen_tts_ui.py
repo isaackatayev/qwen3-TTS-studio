@@ -65,6 +65,7 @@ from storage.persona import delete_persona, list_personas, load_persona, save_pe
 from podcast.models import Outline, Transcript, SpeakerProfile
 from storage.voice import get_available_voices, get_saved_voices, create_speaker_profile
 from config import get_openai_api_key
+from podcast.llm_client import LLMConfig, LLMProvider, get_default_config, validate_connection, DEFAULT_MODELS
 
 
 def auto_transcribe_audio(audio_path: str | None) -> str:
@@ -4294,6 +4295,37 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                                 value="English",
                                 info="Language for script generation and voice synthesis",
                             )
+                            with gr.Accordion("LLM Provider", open=False):
+                                podcast_llm_provider = gr.Dropdown(
+                                    choices=["OpenAI", "Ollama", "OpenRouter"],
+                                    value="Ollama",
+                                    label="Provider",
+                                    info="LLM service for script generation",
+                                )
+                                podcast_llm_model = gr.Textbox(
+                                    label="Model",
+                                    value=DEFAULT_MODELS[LLMProvider.OLLAMA],
+                                    placeholder="Model name (leave empty for default)",
+                                    info="Model to use for generation",
+                                )
+                                podcast_llm_api_key = gr.Textbox(
+                                    label="API Key",
+                                    value="",
+                                    placeholder="Not required for Ollama",
+                                    type="password",
+                                    visible=True,
+                                    info="API key (not needed for Ollama)",
+                                )
+                                podcast_llm_base_url = gr.Textbox(
+                                    label="Base URL",
+                                    value="http://localhost:11434/v1",
+                                    placeholder="Custom API endpoint",
+                                    info="API endpoint URL",
+                                )
+                                podcast_llm_status = gr.HTML(value="")
+                                podcast_llm_test_btn = gr.Button(
+                                    "Test Connection", size="sm"
+                                )
 
                             with gr.Row():
                                 gr.HTML(
@@ -4491,6 +4523,65 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                                 )
                             podcast_history_delete_confirm = gr.State(False)
 
+                    def on_llm_provider_change(provider_name):
+                        """Update defaults when LLM provider changes."""
+                        provider_map = {
+                            "OpenAI": LLMProvider.OPENAI,
+                            "Ollama": LLMProvider.OLLAMA,
+                            "OpenRouter": LLMProvider.OPENROUTER,
+                        }
+                        provider = provider_map.get(provider_name, LLMProvider.OLLAMA)
+                        default_model = DEFAULT_MODELS[provider]
+
+                        if provider == LLMProvider.OLLAMA:
+                            return (
+                                gr.update(value=default_model),
+                                gr.update(value="", placeholder="Not required for Ollama"),
+                                gr.update(value="http://localhost:11434/v1"),
+                                "",
+                            )
+                        elif provider == LLMProvider.OPENROUTER:
+                            return (
+                                gr.update(value=default_model),
+                                gr.update(value="", placeholder="Enter OpenRouter API key"),
+                                gr.update(value="https://openrouter.ai/api/v1"),
+                                "",
+                            )
+                        else:  # OpenAI
+                            return (
+                                gr.update(value=default_model),
+                                gr.update(value="", placeholder="Enter OpenAI API key"),
+                                gr.update(value=""),
+                                "",
+                            )
+
+                    def test_llm_connection(provider_name, model, api_key, base_url):
+                        """Test LLM provider connection."""
+                        provider_map = {
+                            "OpenAI": LLMProvider.OPENAI,
+                            "Ollama": LLMProvider.OLLAMA,
+                            "OpenRouter": LLMProvider.OPENROUTER,
+                        }
+                        provider = provider_map.get(provider_name, LLMProvider.OLLAMA)
+
+                        if not api_key and provider != LLMProvider.OLLAMA:
+                            try:
+                                from config import get_api_key_for_provider
+                                api_key = get_api_key_for_provider(provider.value)
+                            except ValueError:
+                                return '<div style="color: #dc3545;">API key required. Enter key above or set in .env file.</div>'
+
+                        config = get_default_config(
+                            provider=provider,
+                            api_key=api_key or "",
+                            base_url=base_url or "",
+                            model=model or "",
+                        )
+                        success, message = validate_connection(config)
+                        if success:
+                            return f'<div style="color: #28a745;">{message}</div>'
+                        return f'<div style="color: #dc3545;">{message}</div>'
+
                     def build_voice_selections_from_slots(*slot_values):
                         sels = {}
                         num_slots = len(slot_values) // 2
@@ -4583,6 +4674,10 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                         voice_selections,
                         quality_preset,
                         language,
+                        llm_provider_name,
+                        llm_model,
+                        llm_api_key,
+                        llm_base_url,
                     ):
                         is_valid, error_msg = validate_content(
                             topic, key_points, briefing
@@ -4627,6 +4722,43 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                                 gr.update(),
                             )
                             return
+
+                        provider_map = {
+                            "OpenAI": LLMProvider.OPENAI,
+                            "Ollama": LLMProvider.OLLAMA,
+                            "OpenRouter": LLMProvider.OPENROUTER,
+                        }
+                        llm_provider = provider_map.get(llm_provider_name, LLMProvider.OLLAMA)
+
+                        if not llm_api_key and llm_provider != LLMProvider.OLLAMA:
+                            try:
+                                from config import get_api_key_for_provider
+                                llm_api_key = get_api_key_for_provider(llm_provider.value)
+                            except ValueError:
+                                yield (
+                                    create_step_indicator_html(GenerationStep.OUTLINE, 0.0),
+                                    0,
+                                    f"Error: API key required for {llm_provider_name}",
+                                    "",
+                                    f'<div style="color: #dc3545;">API key required for {llm_provider_name}. Enter it in the LLM Provider section or set in .env file.</div>',
+                                    None,
+                                    None,
+                                    None,
+                                    gr.update(visible=False),
+                                    gr.update(value="Generate Podcast", interactive=True),
+                                    gr.update(),
+                                    gr.update(),
+                                    gr.update(),
+                                    gr.update(),
+                                )
+                                return
+
+                        llm_config = get_default_config(
+                            provider=llm_provider,
+                            api_key=llm_api_key or "",
+                            base_url=llm_base_url or "",
+                            model=llm_model or "",
+                        )
 
                         print(f"[LANG] UI selected: {language}")
                         content_input = {
@@ -4785,6 +4917,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                                     voice_selections=voice_output,
                                     quality_preset=quality_preset,
                                     progress_callback=progress_callback,
+                                    llm_config=llm_config,
                                 )
                                 q.put(_DoneEvent(result=result))
                             except Exception as e:
@@ -5365,6 +5498,28 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             ],
                         )
 
+                    podcast_llm_provider.change(
+                        fn=on_llm_provider_change,
+                        inputs=[podcast_llm_provider],
+                        outputs=[
+                            podcast_llm_model,
+                            podcast_llm_api_key,
+                            podcast_llm_base_url,
+                            podcast_llm_status,
+                        ],
+                    )
+
+                    podcast_llm_test_btn.click(
+                        fn=test_llm_connection,
+                        inputs=[
+                            podcast_llm_provider,
+                            podcast_llm_model,
+                            podcast_llm_api_key,
+                            podcast_llm_base_url,
+                        ],
+                        outputs=[podcast_llm_status],
+                    )
+
                     podcast_generate_btn.click(
                         fn=run_podcast_generation,
                         inputs=[
@@ -5375,6 +5530,10 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             podcast_voice_selections_state,
                             podcast_quality_preset,
                             podcast_language,
+                            podcast_llm_provider,
+                            podcast_llm_model,
+                            podcast_llm_api_key,
+                            podcast_llm_base_url,
                         ],
                         outputs=[
                             podcast_step_indicator,
