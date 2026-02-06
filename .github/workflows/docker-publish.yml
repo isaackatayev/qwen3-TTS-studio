@@ -1,0 +1,61 @@
+name: Docker Publish
+
+# Trigger on version tags (e.g., v0.1.0, v1.2.3)
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Set permissions for GITHUB_TOKEN
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1: Checkout repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Docker Buildx for multi-platform builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 3: Login to GitHub Container Registry
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 4: Extract metadata (tags and labels) from git tag
+      # This action automatically:
+      # - Extracts version from git tag (e.g., v0.1.0 -> 0.1.0)
+      # - Creates tags for both version and 'latest'
+      # - Extracts OCI labels from Dockerfile
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/bc-dunia/qwen3-tts-studio
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Step 5: Build and push Docker image to GHCR
+      # Uses multi-stage Dockerfile for optimized image size
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

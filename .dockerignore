@@ -1,16 +1,73 @@
+# Version control
 .git
 .gitignore
+.gitattributes
+
+# Development tools and environments
 .omc
 .claude
+.sisyphus
+.venv
+qwen-tts-env
+venv
+env
+
+# Python artifacts
 __pycache__
 *.pyc
 *.pyo
 *.pyd
+*.egg-info
+dist
+build
+.pytest_cache
+.coverage
+*.egg
+
+# IDE and editor files
+.vscode
+.idea
+*.swp
+*.swo
+*~
 .DS_Store
+.env.local
+.env.*.local
+
+# Environment variables
 .env
+.env.example
 
 # Local model artifacts (mount at runtime instead)
 Qwen3-TTS-12Hz-*
 Qwen3-TTS-Tokenizer-12Hz
+Qwen3-TTS
+
+# Generated data and history
+generation_history
 podcast_history
 voice_profiles
+podcasts
+saved_voices
+personas
+
+# Documentation (except README)
+docs
+*.md
+!README.md
+
+# Testing and CI/CD
+.github
+.gitlab-ci.yml
+.circleci
+Makefile
+tox.ini
+pytest.ini
+setup.cfg
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+.tmp
