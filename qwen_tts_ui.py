@@ -339,7 +339,7 @@ MULTISAMPLE_CSS = """
 }
 """
 
-from audio.model_loader import MODEL_PATHS, get_model, loaded_models, _mps_cleanup
+from audio.model_loader import MODEL_PATHS, get_model, loaded_models, _gpu_cleanup
 from audio.embedding_utils import (
     AudioSampleInfo,
     analyze_audio_samples,
@@ -1209,6 +1209,7 @@ def generate_custom_voice(
             speaker=speaker,
             language=language,
             instruct=instruct if instruct and instruct.strip() else None,
+            non_streaming_mode=True,
             temperature=temperature,
             top_k=int(top_k),
             top_p=top_p,
@@ -1256,7 +1257,7 @@ def generate_custom_voice(
         raise gr.Error(format_user_error(e))
     finally:
         del wavs
-        _mps_cleanup()
+        _gpu_cleanup()
 
 
 def generate_voice_design(
@@ -1329,6 +1330,7 @@ def generate_voice_design(
         gen_kwargs = {
             "text": text,
             "instruct": voice_description.strip(),
+            "non_streaming_mode": True,
             "temperature": temperature,
             "top_k": int(top_k),
             "top_p": top_p,
@@ -1391,7 +1393,7 @@ def generate_voice_design(
         raise gr.Error(format_user_error(e))
     finally:
         del wavs
-        _mps_cleanup()
+        _gpu_cleanup()
 
 
 def clone_voice(
@@ -1461,6 +1463,7 @@ def clone_voice(
                 text=test_text,
                 language=language,
                 voice_clone_prompt=voice_clone_prompt,
+                non_streaming_mode=True,
                 temperature=temperature,
                 top_k=int(top_k),
                 top_p=top_p,
@@ -1516,7 +1519,7 @@ def clone_voice(
     finally:
         del wavs
         del voice_clone_prompt
-        _mps_cleanup()
+        _gpu_cleanup()
 
 
 def clone_voice_multi(
@@ -1625,6 +1628,7 @@ def clone_voice_multi(
                 text=test_text,
                 language=language,
                 voice_clone_prompt=voice_clone_prompt,
+                non_streaming_mode=True,
                 temperature=temperature,
                 top_k=int(top_k),
                 top_p=top_p,
@@ -1699,7 +1703,7 @@ def clone_voice_multi(
     finally:
         del wavs
         del voice_clone_prompt
-        _mps_cleanup()
+        _gpu_cleanup()
 
 
 def analyze_uploaded_samples(audio_files: list) -> tuple[str, str]:
@@ -2042,6 +2046,7 @@ def generate_with_saved_voice(
             text=text,
             language=language,
             voice_clone_prompt=voice_clone_prompt,
+            non_streaming_mode=True,
             temperature=temperature,
             top_k=int(top_k),
             top_p=top_p,
@@ -2088,7 +2093,7 @@ def generate_with_saved_voice(
     finally:
         del wavs
         del voice_clone_prompt
-        _mps_cleanup()
+        _gpu_cleanup()
 
 
 def get_voice_details(saved_voice_id):
@@ -4304,7 +4309,12 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             )
                             with gr.Accordion("LLM Provider", open=False):
                                 podcast_llm_provider = gr.Dropdown(
-                                    choices=["OpenAI", "Ollama", "OpenRouter", "Claude"],
+                                    choices=[
+                                        "OpenAI",
+                                        "Ollama",
+                                        "OpenRouter",
+                                        "Claude",
+                                    ],
                                     value="Ollama",
                                     label="Provider",
                                     info="LLM service for script generation",
@@ -4547,22 +4557,30 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                         if provider == LLMProvider.OLLAMA:
                             return (
                                 gr.update(choices=model_choices, value=default_model),
-                                gr.update(value="", placeholder="Not required for Ollama"),
+                                gr.update(
+                                    value="", placeholder="Not required for Ollama"
+                                ),
                                 gr.update(value="http://localhost:11434/v1"),
                                 "",
                             )
                         elif provider == LLMProvider.OPENROUTER:
                             return (
                                 gr.update(choices=model_choices, value=default_model),
-                                gr.update(value="", placeholder="Enter OpenRouter API key"),
+                                gr.update(
+                                    value="", placeholder="Enter OpenRouter API key"
+                                ),
                                 gr.update(value="https://openrouter.ai/api/v1"),
                                 "",
                             )
                         elif provider == LLMProvider.CLAUDE:
                             return (
                                 gr.update(choices=model_choices, value=default_model),
-                                gr.update(value="", placeholder="Enter Anthropic API key"),
-                                gr.update(value="", placeholder="Default Anthropic endpoint"),
+                                gr.update(
+                                    value="", placeholder="Enter Anthropic API key"
+                                ),
+                                gr.update(
+                                    value="", placeholder="Default Anthropic endpoint"
+                                ),
                                 "",
                             )
                         else:  # OpenAI
@@ -4586,6 +4604,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                         if not api_key and provider != LLMProvider.OLLAMA:
                             try:
                                 from config import get_api_key_for_provider
+
                                 api_key = get_api_key_for_provider(provider.value)
                             except ValueError:
                                 return '<div style="color: #dc3545;">API key required. Enter key above or set in .env file.</div>'
@@ -4748,15 +4767,22 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             "OpenRouter": LLMProvider.OPENROUTER,
                             "Claude": LLMProvider.CLAUDE,
                         }
-                        llm_provider = provider_map.get(llm_provider_name, LLMProvider.OLLAMA)
+                        llm_provider = provider_map.get(
+                            llm_provider_name, LLMProvider.OLLAMA
+                        )
 
                         if not llm_api_key and llm_provider != LLMProvider.OLLAMA:
                             try:
                                 from config import get_api_key_for_provider
-                                llm_api_key = get_api_key_for_provider(llm_provider.value)
+
+                                llm_api_key = get_api_key_for_provider(
+                                    llm_provider.value
+                                )
                             except ValueError:
                                 yield (
-                                    create_step_indicator_html(GenerationStep.OUTLINE, 0.0),
+                                    create_step_indicator_html(
+                                        GenerationStep.OUTLINE, 0.0
+                                    ),
                                     0,
                                     f"Error: API key required for {llm_provider_name}",
                                     "",
@@ -4765,7 +4791,9 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                                     None,
                                     None,
                                     gr.update(visible=False),
-                                    gr.update(value="Generate Podcast", interactive=True),
+                                    gr.update(
+                                        value="Generate Podcast", interactive=True
+                                    ),
                                     gr.update(),
                                     gr.update(),
                                     gr.update(),

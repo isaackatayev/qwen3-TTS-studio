@@ -68,7 +68,7 @@ conda activate qwen3-tts
 ### 3. Install Dependencies
 
 ```bash
-pip install -U qwen-tts
+pip install "qwen-tts>=0.1.1"
 pip install gradio soundfile numpy moviepy openai anthropic
 ```
 
