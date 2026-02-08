@@ -1,13 +1,12 @@
 # ---------------------------------------------------------------------------
-# Dockerfile.serverless – RunPod Serverless image for Qwen3-TTS
+# Dockerfile.serverless – RunPod Serverless image for Qwen3-TTS Studio
+#
+# Full podcast pipeline: LLM → outline → transcript → TTS → combined audio
 #
 # Build:
 #   docker build -f Dockerfile.serverless -t qwen3-tts-serverless .
-#
-# Models should be mounted or baked in at /models (or set QWEN_TTS_MODEL_DIR).
 # ---------------------------------------------------------------------------
 
-# Multi-stage build: builder stage
 FROM python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,14 +15,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /build
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . /build
 
-# Install Python dependencies into a virtualenv
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
@@ -32,40 +29,38 @@ RUN pip install --upgrade pip && \
     pip install soundfile numpy packaging pydantic && \
     pip install runpod && \
     pip install boto3 && \
-    pip install pydub
+    pip install pydub && \
+    pip install moviepy && \
+    pip install openai anthropic
 
 # ---------------------------------------------------------------------------
 # Final stage: runtime
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="Qwen3-TTS Serverless" \
-      org.opencontainers.image.description="RunPod Serverless worker for Qwen3-TTS" \
-      org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.title="Qwen3-TTS Studio Serverless" \
+      org.opencontainers.image.description="RunPod Serverless: full podcast pipeline (LLM + TTS)" \
+      org.opencontainers.image.version="0.2.0"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
-    # Default model directory – override at runtime or bake models in
     QWEN_TTS_MODEL_DIR="/models"
 
 WORKDIR /app
 
-# Runtime system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/* || true
 
-# Copy virtualenv from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy application code (only what the handler needs)
-COPY audio/          /app/audio/
-COPY podcast/models.py /app/podcast/models.py
-COPY podcast/__init__.py /app/podcast/__init__.py
-COPY config.py       /app/config.py
-COPY handler.py      /app/handler.py
+# Copy ALL modules needed for the full pipeline
+COPY audio/           /app/audio/
+COPY podcast/         /app/podcast/
+COPY storage/         /app/storage/
+COPY config.py        /app/config.py
+COPY handler.py       /app/handler.py
 
-# RunPod serverless entry point
 CMD ["python", "-u", "handler.py"]

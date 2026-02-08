@@ -1,46 +1,53 @@
-# Qwen3-TTS — RunPod Serverless Deployment
+# Qwen3-TTS Studio — RunPod Serverless Deployment
 
-Scale-to-zero, pay-per-job TTS via [RunPod Serverless](https://docs.runpod.io/serverless/overview). Models load once per warm worker and stay cached. No Gradio UI runs in serverless mode.
+Scale-to-zero, pay-per-job podcast generation via [RunPod Serverless](https://docs.runpod.io/serverless/overview).
+
+Two modes:
+- **`tts`** — text-to-speech only (fast, simple)
+- **`podcast`** — full pipeline: LLM outline → transcript → TTS → combined audio
 
 ---
 
 ## Quick Start
 
-### 1. Build the Docker image
+### 1. Build & push the Docker image
 
 ```bash
-docker build -f Dockerfile.serverless -t qwen3-tts-serverless .
+docker build -f Dockerfile.serverless -t youruser/qwen3-tts-serverless .
+docker push youruser/qwen3-tts-serverless:latest
 ```
 
-### 2. Provide models
+### 2. Models on a Network Volume
 
-Models are large (~3-7 GB each). Mount them or bake them into the image:
+Create a RunPod Network Volume, attach a temp pod, download:
 
-| Method | How |
-|--------|-----|
-| **RunPod Network Volume** (recommended) | Create a volume, download models there, attach to your endpoint. Set `QWEN_TTS_MODEL_DIR=/runpod-volume/models`. |
-| **Bake into image** | `COPY` the model directories into `/models/` in your Dockerfile. Increases image size but simplifies deployment. |
-| **Download at startup** | Add a startup script that pulls from HuggingFace. Slow cold starts. |
-
-Expected directory layout inside `QWEN_TTS_MODEL_DIR`:
-
-```
-/models/
-├── Qwen3-TTS-12Hz-1.7B-CustomVoice/
-├── Qwen3-TTS-12Hz-0.6B-CustomVoice/
-├── Qwen3-TTS-12Hz-1.7B-Base/
-├── Qwen3-TTS-12Hz-0.6B-Base/
-├── Qwen3-TTS-12Hz-1.7B-VoiceDesign/
-└── Qwen3-TTS-Tokenizer-12Hz/
-    └── model.safetensors
+```bash
+cd /workspace
+mkdir -p models && cd models
+python3.13 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', local_dir='./Qwen3-TTS-12Hz-1.7B-CustomVoice')
+snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz', local_dir='./Qwen3-TTS-Tokenizer-12Hz')
+print('Done!')
+"
 ```
 
-### 3. Deploy on RunPod
+Terminate the temp pod. Models persist on the volume.
 
-1. Push image to Docker Hub / GHCR.
-2. Create a **Serverless Endpoint** on RunPod.
-3. Set the Docker image and environment variables (see below).
-4. Configure GPU type (A100 / A40 / L40S recommended).
+### 3. Create Serverless Endpoint
+
+| Setting | Value |
+|---------|-------|
+| Docker Image | `youruser/qwen3-tts-serverless:latest` |
+| GPU | A40 / L40S / A100 |
+| Network Volume | your volume |
+
+**Environment Variables:**
+
+| Variable | Required | Value |
+|----------|----------|-------|
+| `QWEN_TTS_MODEL_DIR` | **Yes** | `/workspace/models` |
+| `OPENROUTER_API_KEY` | For podcast mode | your key |
 
 ---
 
@@ -48,112 +55,166 @@ Expected directory layout inside `QWEN_TTS_MODEL_DIR`:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `QWEN_TTS_MODEL_DIR` | Yes | `/models` | Base directory containing model folders |
-| `QWEN_TTS_DEVICE` | No | auto-detect | Force device (`cuda:0`, `cpu`) |
-| `QWEN_TTS_MIN_NEW_TOKENS` | No | `60` | Min tokens to prevent audio truncation |
+| `QWEN_TTS_MODEL_DIR` | Yes | `/models` | Base dir containing model folders |
+| `QWEN_TTS_DEVICE` | No | auto | Force device (`cuda:0`, `cpu`) |
+| `OPENROUTER_API_KEY` | For podcast | — | OpenRouter API key (fallback) |
+| `OPENAI_API_KEY` | For podcast | — | OpenAI API key (fallback) |
+| `ANTHROPIC_API_KEY` | For podcast | — | Anthropic API key (fallback) |
 | `S3_BUCKET` | No | — | S3 bucket for audio upload |
 | `S3_ACCESS_KEY` | No | — | S3 access key |
 | `S3_SECRET_KEY` | No | — | S3 secret key |
-| `S3_ENDPOINT` | No | — | S3 endpoint (for R2, MinIO, etc.) |
+| `S3_ENDPOINT` | No | — | S3 endpoint (R2, MinIO) |
 | `S3_REGION` | No | `us-east-1` | S3 region |
-
-> When `S3_BUCKET` + credentials are set, audio is uploaded and a presigned URL is returned. Otherwise, audio is returned as base64.
 
 ---
 
-## API Reference
+## API: Podcast Mode (Full Pipeline)
 
-### Input Schema
-
-POST to your RunPod endpoint's `/run` or `/runsync` URL.
-
-#### Single text
+### Input
 
 ```json
 {
   "input": {
-    "text": "Hello world! This is Qwen3-TTS running on RunPod.",
-    "voice": "male_1",
-    "model": "1.7B-CustomVoice",
-    "output_format": "wav",
-    "params": {
-      "temperature": 0.3,
-      "top_k": 50,
-      "top_p": 0.85,
-      "language": "en"
-    }
-  }
-}
-```
-
-#### Multi-speaker segments (podcast)
-
-```json
-{
-  "input": {
-    "segments": [
-      {
-        "text": "Welcome to our podcast! Today we discuss the future of AI.",
-        "voice": "male_1"
-      },
-      {
-        "text": "Thanks for having me. I think we're at an inflection point.",
-        "voice": "female_1"
-      },
-      {
-        "text": "That's a great perspective. Let's dig deeper.",
-        "voice": "male_1"
-      }
+    "action": "podcast",
+    "topic": "The future of AI in creative industries",
+    "key_points": [
+      "How AI is changing music and art",
+      "The ethics of AI-generated content",
+      "Opportunities for creators"
     ],
-    "model": "1.7B-CustomVoice",
-    "output_format": "mp3",
-    "params": {
-      "temperature": 0.3,
-      "top_k": 50,
-      "top_p": 0.85,
-      "language": "en"
-    }
+    "briefing": "Conversational, insightful, accessible to general audience.",
+    "num_segments": 3,
+    "language": "English",
+    "quality_preset": "standard",
+    "voices": [
+      {"voice_id": "serena", "role": "Host", "type": "preset", "name": "Sarah"},
+      {"voice_id": "ryan", "role": "Expert", "type": "preset", "name": "Ryan"}
+    ],
+    "llm": {
+      "provider": "openrouter",
+      "model": "google/gemini-2.5-flash",
+      "api_key": "sk-or-v1-..."
+    },
+    "output_format": "mp3"
   }
 }
 ```
 
-#### Input fields
+### Podcast Input Fields
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `text` | string | Yes* | — | Text to synthesize (use this OR `segments`) |
-| `segments` | array | Yes* | — | Array of `{text, voice}` objects |
-| `voice` | string | No | `male_1` | Default preset voice name |
-| `model` | string | No | `1.7B-CustomVoice` | Model variant to use |
-| `output_format` | string | No | `wav` | `wav` or `mp3` |
-| `params` | object | No | see below | Generation parameters |
+| `action` | string | Yes | — | Must be `"podcast"` |
+| `topic` | string | Yes | — | Podcast topic |
+| `key_points` | array/string | No | `[]` | Key points to cover |
+| `briefing` | string | No | `""` | Style instructions for the LLM |
+| `num_segments` | int | No | `3` | Number of outline segments |
+| `language` | string | No | `"English"` | Language for transcript |
+| `quality_preset` | string/object | No | `"standard"` | `"quick"`, `"standard"`, or `"premium"` |
+| `voices` | array | Yes | — | Voice selections (see below) |
+| `llm` | object | Yes | — | LLM config (see below) |
+| `output_format` | string | No | `"mp3"` | `"wav"` or `"mp3"` |
 
-\* One of `text` or `segments` is required.
+### Voice Selection Object
 
-#### Params object
+```json
+{"voice_id": "serena", "role": "Host", "type": "preset", "name": "Sarah"}
+```
 
-| Param | Type | Default | Description |
-|-------|------|---------|-------------|
-| `temperature` | float | 0.3 | Sampling temperature |
-| `top_k` | int | 50 | Top-K sampling |
-| `top_p` | float | 0.85 | Nucleus sampling |
-| `repetition_penalty` | float | 1.0 | Repetition penalty |
-| `max_new_tokens` | int | 1024 | Max tokens per chunk |
-| `subtalker_temperature` | float | 0.3 | Sub-talker temperature |
-| `subtalker_top_k` | int | 50 | Sub-talker Top-K |
-| `subtalker_top_p` | float | 0.85 | Sub-talker Top-P |
-| `language` | string | `en` | Language code |
-| `instruct` | string | null | Optional instruction |
+Available preset voices: `serena`, `ryan`, `vivian`, `aiden`, `dylan`, `eric`, `sohee`, `uncle_fu`, `ono_anna`
 
-### Output Schema
+Roles: `Host`, `Expert`, `Guest`, `Narrator`
 
-#### Success (base64)
+### LLM Config Object
+
+```json
+{"provider": "openrouter", "model": "google/gemini-2.5-flash", "api_key": "sk-or-..."}
+```
+
+Providers: `openrouter`, `openai`, `claude`, `ollama`
+
+If `api_key` is omitted, falls back to the corresponding env var (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+
+### Podcast Output
 
 ```json
 {
-  "audio_base64": "<base64-encoded audio bytes>",
+  "audio_base64": "<base64 MP3>",
   "metadata": {
-    "duration_seconds": 3.456,
+    "duration_seconds": 145.2,
+    "sample_rate": 24000,
+    "format": "mp3",
+    "generation_time_seconds": 82.3,
+    "num_dialogue_lines": 18,
+    "num_outline_segments": 3
+  },
+  "transcript": {
+    "dialogues": [
+      {"speaker": "Sarah", "text": "Welcome to our show..."},
+      {"speaker": "Ryan", "text": "Thanks for having me..."}
+    ]
+  },
+  "outline": {
+    "segments": [
+      {"title": "Introduction", "description": "...", "size": "short"}
+    ]
+  }
+}
+```
+
+---
+
+## API: TTS Mode (Text-to-Speech Only)
+
+### Single Text
+
+```json
+{
+  "input": {
+    "action": "tts",
+    "text": "Hello from Qwen3-TTS!",
+    "voice": "serena",
+    "model": "1.7B-CustomVoice",
+    "output_format": "wav"
+  }
+}
+```
+
+### Multi-Speaker Segments
+
+```json
+{
+  "input": {
+    "action": "tts",
+    "segments": [
+      {"text": "Welcome to our show!", "voice": "serena"},
+      {"text": "Thanks for having me.", "voice": "ryan"}
+    ],
+    "model": "1.7B-CustomVoice",
+    "output_format": "mp3"
+  }
+}
+```
+
+### TTS Input Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `action` | string | No | `"tts"` | `"tts"` (default if omitted) |
+| `text` | string | Yes* | — | Text to synthesize |
+| `segments` | array | Yes* | — | Array of `{text, voice}` |
+| `voice` | string | No | `"male_1"` | Default preset voice |
+| `model` | string | No | `"1.7B-CustomVoice"` | Model variant |
+| `output_format` | string | No | `"wav"` | `"wav"` or `"mp3"` |
+| `params` | object | No | — | temperature, top_k, top_p, etc. |
+
+### TTS Output
+
+```json
+{
+  "audio_base64": "<base64>",
+  "metadata": {
+    "duration_seconds": 3.4,
     "sample_rate": 24000,
     "format": "wav",
     "num_segments": 1,
@@ -162,171 +223,97 @@ POST to your RunPod endpoint's `/run` or `/runsync` URL.
 }
 ```
 
-#### Success (S3 upload)
-
-```json
-{
-  "audio_url": "https://your-bucket.s3.amazonaws.com/tts-output/abc123.wav?...",
-  "metadata": {
-    "duration_seconds": 3.456,
-    "sample_rate": 24000,
-    "format": "wav",
-    "num_segments": 1,
-    "generation_time_seconds": 2.1
-  }
-}
-```
-
-#### Error
-
-```json
-{
-  "error": "Generation failed on segment 2: ...",
-  "traceback": "..."
-}
-```
-
 ---
 
-## Chunking / Long-form Audio
-
-Long text is automatically split into ~120-character chunks (sentence-boundary aware) by the existing `audio.generator` module. Each chunk is generated independently with retry logic (up to 3 retries per chunk). Chunks are crossfaded and concatenated into one seamless output.
-
-For 30-minute podcasts, use the `segments` input to pass each dialogue line as a separate segment with its own voice. The handler generates each segment sequentially, concatenates, and returns one file.
-
----
-
-## Example: Call from Python
+## Example: Python Client
 
 ```python
 import requests, json, base64
 
 RUNPOD_API_KEY = "your-api-key"
 ENDPOINT_ID = "your-endpoint-id"
+URL = f"https://api.runpod.ai/v2/{ENDPOINT_ID}/runsync"
 
-resp = requests.post(
-    f"https://api.runpod.ai/v2/{ENDPOINT_ID}/runsync",
-    headers={
-        "Authorization": f"Bearer {RUNPOD_API_KEY}",
-        "Content-Type": "application/json",
-    },
+# Full podcast generation
+resp = requests.post(URL,
+    headers={"Authorization": f"Bearer {RUNPOD_API_KEY}", "Content-Type": "application/json"},
     json={
         "input": {
-            "text": "Hello from Qwen3-TTS on RunPod!",
-            "voice": "male_1",
-            "model": "1.7B-CustomVoice",
-            "output_format": "wav",
+            "action": "podcast",
+            "topic": "The future of AI",
+            "num_segments": 2,
+            "voices": [
+                {"voice_id": "serena", "role": "Host", "type": "preset", "name": "Sarah"},
+                {"voice_id": "ryan", "role": "Expert", "type": "preset", "name": "Ryan"},
+            ],
+            "llm": {
+                "provider": "openrouter",
+                "model": "google/gemini-2.5-flash",
+                "api_key": "sk-or-v1-...",
+            },
+            "output_format": "mp3",
         }
     },
-    timeout=120,
+    timeout=600,
 )
 
 data = resp.json()["output"]
-audio_bytes = base64.b64decode(data["audio_base64"])
-with open("output.wav", "wb") as f:
-    f.write(audio_bytes)
-print(f"Saved {data['metadata']['duration_seconds']}s of audio")
-```
-
----
-
-## Example: cURL
-
-```bash
-curl -s -X POST \
-  "https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync" \
-  -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": {
-      "text": "Hello from Qwen3-TTS!",
-      "voice": "male_1",
-      "model": "1.7B-CustomVoice",
-      "output_format": "wav"
-    }
-  }' | python3 -c "
-import sys, json, base64
-data = json.load(sys.stdin)['output']
-audio = base64.b64decode(data['audio_base64'])
-open('output.wav', 'wb').write(audio)
-print(f'Saved {len(audio)} bytes')
-"
+audio = base64.b64decode(data["audio_base64"])
+with open("podcast.mp3", "wb") as f:
+    f.write(audio)
+print(f"Saved {data['metadata']['duration_seconds']}s podcast")
+print(f"Transcript: {len(data['transcript']['dialogues'])} lines")
 ```
 
 ---
 
 ## Local Testing
 
-### Without RunPod SDK
-
 ```bash
-# Set model directory (if models aren't in current dir)
+# Set model directory
 export QWEN_TTS_MODEL_DIR=/path/to/models
 
-# Run the local test script
+# TTS only
 python scripts/local_runpod_test.py
+python scripts/local_runpod_test.py --text "Custom text" --voice serena
 
-# Custom text
-python scripts/local_runpod_test.py --text "Custom text here" --voice male_1
-
-# Multi-speaker segments
+# Multi-speaker TTS
 python scripts/local_runpod_test.py --segments
 
-# Save to specific file
-python scripts/local_runpod_test.py --save my_audio.wav
+# Full podcast pipeline (needs LLM API key)
+export OPENROUTER_API_KEY=sk-or-v1-...
+python scripts/local_runpod_test.py --podcast
 
-# Use a custom JSON payload
+# Custom payload
 python scripts/local_runpod_test.py --payload my_job.json
 
-# MP3 output
-python scripts/local_runpod_test.py --format mp3
+# Save to specific file
+python scripts/local_runpod_test.py --save output.mp3 --format mp3
 ```
-
-### With RunPod SDK (simulated)
-
-```bash
-pip install runpod
-python handler.py
-# In another terminal, send test requests to the local RunPod test server
-```
-
----
-
-## Available Preset Voices
-
-The available voices depend on the model variant. For `1.7B-CustomVoice` / `0.6B-CustomVoice`, run:
-
-```python
-from audio.model_loader import get_model
-model = get_model("1.7B-CustomVoice")
-print(model.get_supported_speakers())
-```
-
-Common presets include: `male_1`, `male_2`, `female_1`, `female_2`, etc.
 
 ---
 
 ## Architecture
 
 ```
-RunPod Job
+RunPod Job (action: "podcast")
     │
-    ▼
-handler.py  ─── handler(job)
-    │
-    ├── audio.model_loader.get_model()   ← cached per warm worker
-    │
-    ├── audio.generator._generate_preset_voice()
-    │   └── _split_text_into_chunks()    ← auto-chunking
-    │   └── model.generate_custom_voice()
-    │   └── retry logic (3 attempts)
-    │
-    ├── crossfade & concatenate segments
+    ├── podcast.orchestrator.generate_podcast()
+    │   ├── LLM → generate outline (via OpenRouter/OpenAI/Claude)
+    │   ├── LLM → generate transcript
+    │   ├── TTS → generate audio clips (audio.batch)
+    │   │   └── audio.model_loader.get_model()  ← cached per warm worker
+    │   │   └── audio.generator per dialogue line
+    │   └── audio.combiner → final MP3
     │
     ├── encode (WAV/MP3)
-    │
-    └── S3 upload (if configured) → audio_url
-        OR base64 encode           → audio_base64
-```
+    └── S3 upload or base64
 
-No Gradio, no FastAPI. Pure RunPod `handler(job)` function.
+RunPod Job (action: "tts")
+    │
+    ├── audio.model_loader.get_model()  ← cached
+    ├── audio.generator per segment
+    ├── crossfade & concatenate
+    ├── encode (WAV/MP3)
+    └── S3 upload or base64
+```

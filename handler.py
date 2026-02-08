@@ -1,16 +1,11 @@
 """
-RunPod Serverless handler for Qwen3-TTS.
+RunPod Serverless handler for Qwen3-TTS Studio.
 
-Stateless JSON job handler that loads models once per warm worker (global
-cache) and generates audio from text via the existing audio/ pipeline.
+Two modes:
+  1. "tts"     – text-to-speech only (default)
+  2. "podcast" – full pipeline: LLM outline → transcript → TTS → combined audio
 
-Accepts:
-  - text (str) or segments (list[dict]) with per-segment voice/text
-  - voice (preset name), model, params, output_format
-
-Returns:
-  - audio_base64 (or audio_url when S3 is configured)
-  - metadata: duration_seconds, sample_rate, format, num_segments
+Models are loaded once per warm worker (global cache).
 """
 
 from __future__ import annotations
@@ -29,45 +24,34 @@ import numpy as np
 import soundfile as sf
 
 # ---------------------------------------------------------------------------
-# Ensure project root is on sys.path so `audio.*` imports resolve when
-# handler.py is executed directly (e.g. `python handler.py`).
+# Ensure project root is on sys.path so `audio.*` / `podcast.*` imports work
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = str(Path(__file__).resolve().parent)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
-# Audio generation imports (lazy-loaded on first job for faster cold start)
+# Lazy-import flag
 # ---------------------------------------------------------------------------
-_generator_loaded = False
+_imports_ready = False
 
 
 def _ensure_imports():
-    """Lazy-import heavy modules so the handler file can be parsed quickly."""
-    global _generator_loaded
-    if _generator_loaded:
+    global _imports_ready
+    if _imports_ready:
         return
-    # These trigger model-framework imports (torch, transformers, etc.)
     import audio.model_loader  # noqa: F401
     import audio.generator  # noqa: F401
 
-    _generator_loaded = True
+    _imports_ready = True
 
 
 # ---------------------------------------------------------------------------
-# S3 upload helper (optional – returns None when not configured)
+# S3 upload helper
 # ---------------------------------------------------------------------------
 
 def _s3_upload(data: bytes, key: str, content_type: str) -> str | None:
-    """Upload bytes to S3-compatible storage and return a public/signed URL.
-
-    Required env vars:
-      S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY
-    Optional:
-      S3_ENDPOINT (for R2/MinIO), S3_REGION (default us-east-1)
-
-    Returns None if S3 is not configured.
-    """
+    """Upload bytes to S3-compatible storage; return presigned URL or None."""
     bucket = os.environ.get("S3_BUCKET", "").strip()
     access_key = os.environ.get("S3_ACCESS_KEY", "").strip()
     secret_key = os.environ.get("S3_SECRET_KEY", "").strip()
@@ -90,37 +74,26 @@ def _s3_upload(data: bytes, key: str, content_type: str) -> str | None:
             region_name=region,
             config=BotoConfig(signature_version="s3v4"),
         )
-
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=data,
-            ContentType=content_type,
-        )
-
-        # Generate presigned URL (1 hour expiry)
+        s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
         url = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=3600,
         )
         return url
-
     except Exception as exc:
         print(f"[S3] Upload failed: {exc}", flush=True)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Core generation logic
+# Default TTS params & helpers
 # ---------------------------------------------------------------------------
 
-# Retry config for individual segment generation
 MAX_SEGMENT_RETRIES = 3
 RETRY_DELAYS = (2, 5, 10)
 
-# Default TTS params
-DEFAULT_PARAMS: dict[str, Any] = {
+DEFAULT_TTS_PARAMS: dict[str, Any] = {
     "temperature": 0.3,
     "top_k": 50,
     "top_p": 0.85,
@@ -135,8 +108,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
 
 
 def _merge_params(user_params: dict | None) -> dict[str, Any]:
-    """Merge user-supplied params over defaults."""
-    merged = dict(DEFAULT_PARAMS)
+    merged = dict(DEFAULT_TTS_PARAMS)
     if user_params:
         for k, v in user_params.items():
             if v is not None:
@@ -145,20 +117,12 @@ def _merge_params(user_params: dict | None) -> dict[str, Any]:
 
 
 def _generate_single_segment(
-    text: str,
-    voice: str,
-    model_name: str,
-    params: dict[str, Any],
+    text: str, voice: str, model_name: str, params: dict[str, Any],
 ) -> tuple[np.ndarray, int]:
-    """Generate audio for a single text segment with retry logic.
-
-    Returns (audio_array, sample_rate).
-    """
     from audio.model_loader import get_model
     from audio.generator import _generate_preset_voice
 
     model = get_model(model_name)
-
     last_err: Exception | None = None
     for attempt in range(MAX_SEGMENT_RETRIES + 1):
         try:
@@ -168,72 +132,36 @@ def _generate_single_segment(
             last_err = exc
             if attempt < MAX_SEGMENT_RETRIES:
                 delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
-                print(
-                    f"[HANDLER] Segment retry {attempt + 1}/{MAX_SEGMENT_RETRIES}: {exc}",
-                    flush=True,
-                )
+                print(f"[HANDLER] Segment retry {attempt + 1}: {exc}", flush=True)
                 time.sleep(delay)
-
-    raise RuntimeError(
-        f"Segment generation failed after {MAX_SEGMENT_RETRIES + 1} attempts: {last_err}"
-    )
+    raise RuntimeError(f"Segment failed after {MAX_SEGMENT_RETRIES + 1} attempts: {last_err}")
 
 
 def _crossfade(a: np.ndarray, b: np.ndarray, sr: int, ms: int = 30) -> np.ndarray:
-    """Crossfade two audio arrays."""
     from audio.generator import _crossfade_audio
-
     return _crossfade_audio(a, b, sr, fade_ms=ms)
 
 
 def _encode_output(
-    audio: np.ndarray,
+    audio_bytes: bytes,
+    ext: str,
+    content_type: str,
+    duration: float,
     sr: int,
-    output_format: str,
     job_id: str,
+    extra_meta: dict | None = None,
 ) -> dict[str, Any]:
-    """Encode audio array to the requested format, upload to S3 or return base64.
-
-    Returns dict with either audio_base64 or audio_url, plus metadata.
-    """
-    buf = io.BytesIO()
-
-    if output_format == "mp3":
-        # Write WAV to buffer first, then convert to MP3 via pydub/ffmpeg
-        try:
-            from pydub import AudioSegment
-
-            wav_buf = io.BytesIO()
-            sf.write(wav_buf, audio, sr, format="WAV")
-            wav_buf.seek(0)
-            seg = AudioSegment.from_wav(wav_buf)
-            seg.export(buf, format="mp3", bitrate="192k")
-            content_type = "audio/mpeg"
-            ext = "mp3"
-        except ImportError:
-            # Fallback: return WAV if pydub not available
-            print("[HANDLER] pydub not installed, falling back to WAV", flush=True)
-            sf.write(buf, audio, sr, format="WAV")
-            content_type = "audio/wav"
-            ext = "wav"
-    else:
-        sf.write(buf, audio, sr, format="WAV")
-        content_type = "audio/wav"
-        ext = "wav"
-
-    audio_bytes = buf.getvalue()
-    duration = len(audio) / sr
-
-    metadata = {
+    """Build response dict with audio_url or audio_base64."""
+    metadata: dict[str, Any] = {
         "duration_seconds": round(duration, 3),
         "sample_rate": sr,
         "format": ext,
     }
+    if extra_meta:
+        metadata.update(extra_meta)
 
-    # Try S3 upload first
     s3_key = f"tts-output/{job_id}.{ext}"
     url = _s3_upload(audio_bytes, s3_key, content_type)
-
     if url:
         return {"audio_url": url, "metadata": metadata}
     else:
@@ -241,152 +169,257 @@ def _encode_output(
         return {"audio_base64": b64, "metadata": metadata}
 
 
-# ---------------------------------------------------------------------------
-# RunPod handler
-# ---------------------------------------------------------------------------
+def _audio_to_bytes(audio: np.ndarray, sr: int, output_format: str) -> tuple[bytes, str, str]:
+    """Convert numpy audio to bytes in the requested format."""
+    buf = io.BytesIO()
+    if output_format == "mp3":
+        try:
+            from pydub import AudioSegment
+            wav_buf = io.BytesIO()
+            sf.write(wav_buf, audio, sr, format="WAV")
+            wav_buf.seek(0)
+            seg = AudioSegment.from_wav(wav_buf)
+            seg.export(buf, format="mp3", bitrate="192k")
+            return buf.getvalue(), "mp3", "audio/mpeg"
+        except ImportError:
+            print("[HANDLER] pydub not installed, falling back to WAV", flush=True)
 
-def handler(job: dict) -> dict[str, Any]:
-    """RunPod Serverless handler entry point.
+    sf.write(buf, audio, sr, format="WAV")
+    return buf.getvalue(), "wav", "audio/wav"
 
-    Expected ``job["input"]`` schema:
 
-    .. code-block:: json
+# ===================================================================
+# ACTION: tts  (text-to-speech only)
+# ===================================================================
 
-        {
-            "text": "Hello world",
-            "voice": "male_1",
-            "model": "1.7B-CustomVoice",
-            "params": {
-                "temperature": 0.3,
-                "top_k": 50,
-                "top_p": 0.85,
-                "language": "en"
-            },
-            "output_format": "wav"
-        }
-
-    Or with multi-speaker segments:
-
-    .. code-block:: json
-
-        {
-            "segments": [
-                {"text": "Welcome!", "voice": "male_1"},
-                {"text": "Thanks!", "voice": "female_1"}
-            ],
-            "model": "1.7B-CustomVoice",
-            "params": {},
-            "output_format": "mp3"
-        }
-    """
+def _handle_tts(job_id: str, inp: dict) -> dict[str, Any]:
     _ensure_imports()
 
-    job_id = job.get("id", "local")
-    inp = job.get("input", {})
-
-    # ---- Validate input ----
     text: str | None = inp.get("text")
     segments: list[dict] | None = inp.get("segments")
-
     if not text and not segments:
         return {"error": "Either 'text' or 'segments' is required."}
 
     voice: str = inp.get("voice", "male_1")
     model_name: str = inp.get("model", "1.7B-CustomVoice")
     output_format: str = inp.get("output_format", "wav").lower()
-    user_params: dict | None = inp.get("params")
-    params = _merge_params(user_params)
+    params = _merge_params(inp.get("params"))
 
     if output_format not in ("wav", "mp3"):
         return {"error": f"Unsupported output_format: {output_format}. Use 'wav' or 'mp3'."}
 
-    # ---- Build segment list ----
-    if segments:
-        seg_list = [
-            {
-                "text": s.get("text", ""),
-                "voice": s.get("voice", voice),
-            }
-            for s in segments
-            if s.get("text", "").strip()
-        ]
-    else:
-        seg_list = [{"text": text, "voice": voice}]
-
+    seg_list = (
+        [{"text": s.get("text", ""), "voice": s.get("voice", voice)} for s in segments if s.get("text", "").strip()]
+        if segments
+        else [{"text": text, "voice": voice}]
+    )
     if not seg_list:
         return {"error": "No non-empty segments to generate."}
 
-    # ---- Generate audio for each segment ----
-    print(
-        f"[HANDLER] Job {job_id}: {len(seg_list)} segment(s), model={model_name}, "
-        f"format={output_format}",
-        flush=True,
-    )
+    print(f"[TTS] Job {job_id}: {len(seg_list)} segment(s), model={model_name}", flush=True)
     t0 = time.time()
 
     all_audio: list[np.ndarray] = []
-    sr: int = 0
-
+    sr = 0
     for i, seg in enumerate(seg_list):
-        seg_text = seg["text"]
-        seg_voice = seg["voice"]
-        print(
-            f"[HANDLER] Segment {i + 1}/{len(seg_list)}: voice={seg_voice}, "
-            f"chars={len(seg_text)}",
-            flush=True,
-        )
+        print(f"[TTS] Segment {i+1}/{len(seg_list)}: voice={seg['voice']}, chars={len(seg['text'])}", flush=True)
         try:
-            audio_arr, seg_sr = _generate_single_segment(
-                seg_text, seg_voice, model_name, params
-            )
+            arr, seg_sr = _generate_single_segment(seg["text"], seg["voice"], model_name, params)
         except Exception as exc:
-            return {
-                "error": f"Generation failed on segment {i + 1}: {exc}",
-                "traceback": traceback.format_exc(),
-            }
-
+            return {"error": f"TTS failed on segment {i+1}: {exc}", "traceback": traceback.format_exc()}
         if sr == 0:
             sr = seg_sr
-        all_audio.append(audio_arr)
+        all_audio.append(arr)
 
-    # ---- Concatenate segments ----
-    if len(all_audio) == 1:
-        merged = all_audio[0]
-    else:
-        merged = all_audio[0]
-        for audio in all_audio[1:]:
-            merged = _crossfade(merged, audio, sr)
+    merged = all_audio[0]
+    for a in all_audio[1:]:
+        merged = _crossfade(merged, a, sr)
 
     elapsed = time.time() - t0
-    print(
-        f"[HANDLER] Job {job_id} done: {len(merged)/sr:.1f}s audio in {elapsed:.1f}s",
-        flush=True,
+    audio_bytes, ext, ct = _audio_to_bytes(merged, sr, output_format)
+    return _encode_output(audio_bytes, ext, ct, len(merged) / sr, sr, job_id, {
+        "num_segments": len(seg_list),
+        "generation_time_seconds": round(elapsed, 3),
+    })
+
+
+# ===================================================================
+# ACTION: podcast  (full LLM → outline → transcript → TTS → combine)
+# ===================================================================
+
+def _handle_podcast(job_id: str, inp: dict) -> dict[str, Any]:
+    """Run the full podcast generation pipeline."""
+    _ensure_imports()
+
+    # ---- Required fields ----
+    topic = str(inp.get("topic", "")).strip()
+    if not topic:
+        return {"error": "'topic' is required for podcast generation."}
+
+    voices_raw = inp.get("voices")
+    if not voices_raw or not isinstance(voices_raw, list):
+        return {"error": "'voices' array is required (list of {voice_id, role, type, name})."}
+
+    # ---- Optional fields ----
+    key_points = inp.get("key_points", [])
+    if isinstance(key_points, str):
+        key_points = [k.strip() for k in key_points.split("\n") if k.strip()]
+    briefing = str(inp.get("briefing", "")).strip()
+    num_segments = int(inp.get("num_segments", 3))
+    language = str(inp.get("language", "English")).strip()
+    quality_preset = inp.get("quality_preset", "standard")
+    output_format = str(inp.get("output_format", "mp3")).lower()
+
+    # ---- LLM config ----
+    llm_raw = inp.get("llm", {})
+    if not isinstance(llm_raw, dict):
+        return {"error": "'llm' must be an object with provider, model, api_key."}
+
+    llm_provider_str = str(llm_raw.get("provider", "openrouter")).lower()
+    llm_model = str(llm_raw.get("model", "")).strip()
+    llm_api_key = str(llm_raw.get("api_key", "")).strip()
+
+    # Allow API key from env vars as fallback
+    if not llm_api_key:
+        env_key_map = {
+            "openrouter": "OPENROUTER_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "claude": "ANTHROPIC_API_KEY",
+            "ollama": "",
+        }
+        env_var = env_key_map.get(llm_provider_str, "")
+        if env_var:
+            llm_api_key = os.environ.get(env_var, "").strip()
+        if not llm_api_key and llm_provider_str != "ollama":
+            return {"error": f"LLM API key required. Pass in llm.api_key or set {env_var} env var."}
+
+    from podcast.llm_client import LLMProvider, get_default_config
+
+    provider_map = {
+        "openai": LLMProvider.OPENAI,
+        "openrouter": LLMProvider.OPENROUTER,
+        "claude": LLMProvider.CLAUDE,
+        "ollama": LLMProvider.OLLAMA,
+    }
+    provider = provider_map.get(llm_provider_str)
+    if provider is None:
+        return {"error": f"Unknown LLM provider: {llm_provider_str}. Use openai/openrouter/claude/ollama."}
+
+    llm_config = get_default_config(
+        provider=provider,
+        api_key=llm_api_key,
+        model=llm_model,
     )
 
-    # ---- Encode & return ----
-    result = _encode_output(merged, sr, output_format, job_id)
-    result["metadata"]["num_segments"] = len(seg_list)
-    result["metadata"]["generation_time_seconds"] = round(elapsed, 3)
+    # ---- Run the orchestrator ----
+    from podcast.orchestrator import generate_podcast
+
+    print(f"[PODCAST] Job {job_id}: topic={topic!r}, segments={num_segments}, provider={llm_provider_str}", flush=True)
+    t0 = time.time()
+
+    content_input: dict[str, object] = {
+        "topic": topic,
+        "key_points": key_points,
+        "briefing": briefing,
+        "num_segments": num_segments,
+        "language": language,
+    }
+
+    try:
+        artifacts = generate_podcast(
+            content_input=content_input,
+            voice_selections=voices_raw,
+            quality_preset=quality_preset,
+            llm_config=llm_config,
+        )
+    except Exception as exc:
+        return {"error": f"Podcast generation failed: {exc}", "traceback": traceback.format_exc()}
+
+    elapsed = time.time() - t0
+    print(f"[PODCAST] Job {job_id} pipeline done in {elapsed:.1f}s", flush=True)
+
+    # ---- Read the combined audio file and return ----
+    combined_path = artifacts.get("combined_audio_path", "")
+    if not combined_path or not Path(combined_path).exists():
+        return {"error": "Pipeline completed but combined audio file not found."}
+
+    combined_audio_data, sr = sf.read(combined_path)
+    audio_bytes, ext, ct = _audio_to_bytes(combined_audio_data, sr, output_format)
+    duration = len(combined_audio_data) / sr
+
+    # Read transcript for metadata
+    transcript_data = None
+    transcript_path = artifacts.get("transcript_path", "")
+    if transcript_path and Path(transcript_path).exists():
+        import json
+        transcript_data = json.loads(Path(transcript_path).read_text())
+
+    outline_data = None
+    outline_path = artifacts.get("outline_path", "")
+    if outline_path and Path(outline_path).exists():
+        import json
+        outline_data = json.loads(Path(outline_path).read_text())
+
+    result = _encode_output(audio_bytes, ext, ct, duration, sr, job_id, {
+        "generation_time_seconds": round(elapsed, 3),
+        "num_dialogue_lines": len(transcript_data.get("dialogues", [])) if transcript_data else 0,
+        "num_outline_segments": len(outline_data.get("segments", [])) if outline_data else 0,
+    })
+
+    # Include transcript & outline in response for inspection
+    if transcript_data:
+        result["transcript"] = transcript_data
+    if outline_data:
+        result["outline"] = outline_data
+
+    # Cleanup temp podcast dir
+    podcast_dir = artifacts.get("podcast_dir", "")
+    if podcast_dir and Path(podcast_dir).exists():
+        import shutil
+        shutil.rmtree(podcast_dir, ignore_errors=True)
+
     return result
 
 
-# ---------------------------------------------------------------------------
-# Entry point – RunPod serverless OR local testing
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Main handler
+# ===================================================================
+
+def handler(job: dict) -> dict[str, Any]:
+    """RunPod Serverless handler.
+
+    Dispatches to _handle_tts or _handle_podcast based on ``input.action``.
+
+    Actions:
+      - ``"tts"`` (default): text-to-speech only
+      - ``"podcast"``: full pipeline (LLM → outline → transcript → TTS → combine)
+    """
+    job_id = job.get("id", "local")
+    inp = job.get("input", {})
+    action = str(inp.get("action", "tts")).lower()
+
+    if action == "podcast":
+        return _handle_podcast(job_id, inp)
+    elif action == "tts":
+        return _handle_tts(job_id, inp)
+    else:
+        return {"error": f"Unknown action: {action}. Use 'tts' or 'podcast'."}
+
+
+# ===================================================================
+# Entry point
+# ===================================================================
 
 if __name__ == "__main__":
-    # When run directly, start the RunPod serverless worker.
-    # For local testing without RunPod, use scripts/local_runpod_test.py instead.
     try:
         import runpod
-
         print("[HANDLER] Starting RunPod serverless worker …", flush=True)
         runpod.serverless.start({"handler": handler})
     except ImportError:
         print(
-            "[HANDLER] runpod package not installed. "
-            "Install with: pip install runpod\n"
-            "For local testing, run: python scripts/local_runpod_test.py",
+            "[HANDLER] runpod not installed. For local testing:\n"
+            "  python scripts/local_runpod_test.py\n"
+            "  python scripts/local_runpod_test.py --podcast",
             flush=True,
         )
         sys.exit(1)
