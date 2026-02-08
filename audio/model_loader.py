@@ -15,12 +15,14 @@ import torch
 # (padding bugs in 12Hz tokenizer decode: commits 5f8581d0, 6cafe558)
 QWEN_TTS_MIN_VERSION = "0.1.1"
 
+_MODEL_DIR = os.environ.get("QWEN_TTS_MODEL_DIR", "").strip() or "."
+
 MODEL_PATHS = {
-    "1.7B-CustomVoice": "./Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    "0.6B-CustomVoice": "./Qwen3-TTS-12Hz-0.6B-CustomVoice",
-    "1.7B-Base": "./Qwen3-TTS-12Hz-1.7B-Base",
-    "0.6B-Base": "./Qwen3-TTS-12Hz-0.6B-Base",
-    "1.7B-VoiceDesign": "./Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "1.7B-CustomVoice": os.path.join(_MODEL_DIR, "Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+    "0.6B-CustomVoice": os.path.join(_MODEL_DIR, "Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+    "1.7B-Base": os.path.join(_MODEL_DIR, "Qwen3-TTS-12Hz-1.7B-Base"),
+    "0.6B-Base": os.path.join(_MODEL_DIR, "Qwen3-TTS-12Hz-0.6B-Base"),
+    "1.7B-VoiceDesign": os.path.join(_MODEL_DIR, "Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
 }
 
 MAX_LOADED_MODELS = 1
@@ -186,7 +188,7 @@ def get_model(model_name: str):
         if not os.path.exists(model_path):
             raise ValueError(f"Model not found: {model_path}")
 
-        tokenizer_src = Path("Qwen3-TTS-Tokenizer-12Hz/model.safetensors")
+        tokenizer_src = Path(_MODEL_DIR) / "Qwen3-TTS-Tokenizer-12Hz" / "model.safetensors"
         speech_tokenizer_dst = (
             Path(model_path) / "speech_tokenizer" / "model.safetensors"
         )
