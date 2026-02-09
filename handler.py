@@ -382,6 +382,46 @@ def _handle_podcast(job_id: str, inp: dict) -> dict[str, Any]:
 
 
 # ===================================================================
+# ACTION: debug (filesystem inspection)
+# ===================================================================
+
+def _handle_debug() -> dict[str, Any]:
+    """List filesystem paths so we can find where the volume is mounted."""
+    import subprocess
+    info: dict[str, Any] = {
+        "QWEN_TTS_MODEL_DIR": os.environ.get("QWEN_TTS_MODEL_DIR", "(not set)"),
+        "cwd": os.getcwd(),
+    }
+
+    # Check common mount points
+    for path in ["/runpod-volume", "/workspace", "/models", "/mnt", "/data"]:
+        try:
+            if os.path.exists(path):
+                contents = os.listdir(path)
+                info[path] = contents[:20]
+                # Go one level deeper for model dirs
+                for item in contents:
+                    sub = os.path.join(path, item)
+                    if os.path.isdir(sub):
+                        try:
+                            info[f"{path}/{item}"] = os.listdir(sub)[:10]
+                        except Exception:
+                            pass
+            else:
+                info[path] = "(does not exist)"
+        except Exception as e:
+            info[path] = f"(error: {e})"
+
+    # Also check root-level dirs
+    try:
+        info["/"] = sorted(os.listdir("/"))
+    except Exception:
+        pass
+
+    return info
+
+
+# ===================================================================
 # Main handler
 # ===================================================================
 
@@ -398,12 +438,14 @@ def handler(job: dict) -> dict[str, Any]:
     inp = job.get("input", {})
     action = str(inp.get("action", "tts")).lower()
 
-    if action == "podcast":
+    if action == "debug":
+        return _handle_debug()
+    elif action == "podcast":
         return _handle_podcast(job_id, inp)
     elif action == "tts":
         return _handle_tts(job_id, inp)
     else:
-        return {"error": f"Unknown action: {action}. Use 'tts' or 'podcast'."}
+        return {"error": f"Unknown action: {action}. Use 'tts', 'podcast', or 'debug'."}
 
 
 # ===================================================================
